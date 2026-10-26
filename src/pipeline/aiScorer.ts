@@ -4,12 +4,12 @@
  *   Call 2 (strong matches with dupes): dedup check only — skipped when no prior same-company+title in DB
  */
 
-import OpenAI from 'openai';
 import type { JobPosting } from './fetcher';
 import type { SettingsRow, SearchGroupRow } from '../db';
 import { DEFAULT_SUMMARY_PROMPT } from '../db';
 import { resolvePreferredLabels } from './locationNormalizer';
-import { openAiGate } from './openAiGate';
+import { aiGate } from './openAiGate';
+import { createAiClient, normalizeAiProvider, resolveAiModel, type AiProvider } from './aiProvider';
 
 /**
  * The slice of `resolveLimits` the scorer needs. Passed in rather than read here, so the limit and
@@ -19,6 +19,7 @@ export interface ScoringLimits {
   /** '' when the account's limits match no published tier. Display and error wording only. */
   openAiTier: string;
   openAiConcurrencyFor(model: string): number;
+  aiConcurrencyFor(provider: AiProvider, model: string): number;
 }
 
 export type Verdict = 'STRONG_MATCH' | 'WEAK_MATCH' | 'NO_MATCH';
@@ -346,61 +347,38 @@ async function callScoringLlm(
   systemPrompt: string,
   userMessage: string,
   model: string,
-  openAiKey: string,
+  provider: AiProvider,
+  apiKey: string,
 ): Promise<{ result: ScoringLlmOutput; usage: TokenUsage }> {
-  const client = new OpenAI({ apiKey: openAiKey });
-  const response = await client.responses.create({
+  const client = createAiClient(provider, apiKey);
+  return client.generateJson<ScoringLlmOutput>({
     model,
-    input: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userMessage },
-    ],
-    // Budget covers the model's internal reasoning tokens as well as the JSON answer. The schema
-    // caps the answer near 250 tokens; the rest is headroom so reasoning can never starve it.
-    // Unused budget is not billed, so the ceiling only ever prevents a truncated (empty) response.
-    max_output_tokens: 2000,
-    text: {
-      format: {
-        type: 'json_schema',
-        name: 'job_evaluation',
-        strict: true,
-        schema: {
+    systemPrompt,
+    userMessage,
+    maxOutputTokens: 2000,
+    schemaName: 'job_evaluation',
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        score:              { type: 'integer', minimum: 0, maximum: 100 },
+        headline:           { type: 'string' },
+        pros:               { type: 'array', items: { type: 'string' } },
+        cons:               { type: 'array', items: {
           type: 'object',
           additionalProperties: false,
           properties: {
-            score:              { type: 'integer', minimum: 0, maximum: 100 },
-            headline:           { type: 'string' },
-            pros:               { type: 'array', items: { type: 'string' } },
-            // `strict: true` demands `additionalProperties: false` and a full `required` list on the
-            // nested object too, not just the root.
-            cons:               { type: 'array', items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                text:          { type: 'string' },
-                disqualifying: { type: 'boolean' },
-              },
-              required: ['text', 'disqualifying'],
-            } },
-            rejection_category: { type: 'string', enum: ['NO_VISA', 'LANGUAGE_MISMATCH', 'PROFILE_MISMATCH', 'OTHER', 'NONE'] },
-            summary:            { type: ['string', 'null'] },
+            text:          { type: 'string' },
+            disqualifying: { type: 'boolean' },
           },
-          required: ['score', 'headline', 'pros', 'cons', 'rejection_category', 'summary'],
-        },
+          required: ['text', 'disqualifying'],
+        } },
+        rejection_category: { type: 'string', enum: ['NO_VISA', 'LANGUAGE_MISMATCH', 'PROFILE_MISMATCH', 'OTHER', 'NONE'] },
+        summary:            { type: ['string', 'null'] },
       },
+      required: ['score', 'headline', 'pros', 'cons', 'rejection_category', 'summary'],
     },
   });
-
-  const text = response.output_text;
-  if (!text) throw new Error('Empty response from OpenAI');
-  return {
-    result: JSON.parse(text) as ScoringLlmOutput,
-    usage: {
-      inputTokens: response.usage?.input_tokens ?? 0,
-      cachedInputTokens: response.usage?.input_tokens_details?.cached_tokens ?? 0,
-      outputTokens: response.usage?.output_tokens ?? 0,
-    },
-  };
 }
 
 // ── Rate limits ──────────────────────────────────────────────────────────────
@@ -443,11 +421,12 @@ async function callScoringLlmWithBackoff(
   systemPrompt: string,
   userMessage: string,
   model: string,
-  openAiKey: string,
+  provider: AiProvider,
+  apiKey: string,
 ): Promise<{ result: ScoringLlmOutput; usage: TokenUsage }> {
   for (let attempt = 0; ; attempt++) {
     try {
-      return await callScoringLlm(systemPrompt, userMessage, model, openAiKey);
+      return await callScoringLlm(systemPrompt, userMessage, model, provider, apiKey);
     } catch (err) {
       if (!isRateLimit(err) || attempt >= RATE_LIMIT_MAX_ATTEMPTS - 1) throw err;
       // Jitter matters: the gate's workers are throttled in lockstep, so without it
@@ -487,13 +466,15 @@ function freeTierQuotaNote(tier: string, model: string, jobCount: number, errorT
 export async function scoreJobs(
   jobs: JobPosting[],
   settings: SettingsRow,
-  openAiKey: string,
+  apiKey: string,
   limits: ScoringLimits,
+  task: 'soft' | 'hard' = 'soft',
   onProgress?: (done: number, total: number) => void,
 ): Promise<{ jobs: ScoredJob[]; tokenUsage: TokenUsage; rateLimited: boolean; failed: number; firstError: string | null }> {
-  const model = settings.ai_model;
+  const provider = normalizeAiProvider(settings.ai_provider);
+  const model = resolveAiModel(provider, settings.ai_model, task);
   const openAiTier = limits.openAiTier;
-  const concurrency = limits.openAiConcurrencyFor(model);
+  const concurrency = limits.aiConcurrencyFor(provider, model);
   // The whole tier→concurrency table (APIlimits.md §3.1) is linear in an *assumed* 6s per call that
   // has never been measured — the weakest input in the spec. Log the real figure so the Free and
   // Tier 1 rows can be re-derived from data rather than from the assumption (caveat C7).
@@ -507,7 +488,7 @@ export async function scoreJobs(
 
   type WorkerResult = { scored: ScoredJob; usage: TokenUsage } | null;
 
-  const settled = await Promise.all(jobs.map((job) => openAiGate(openAiKey, model, concurrency, async (): Promise<WorkerResult> => {
+  const settled = await Promise.all(jobs.map((job) => aiGate(provider, apiKey, model, concurrency, async (): Promise<WorkerResult> => {
     let callResult: { result: ScoringLlmOutput; usage: TokenUsage } | null = null;
 
     const isSparse = job.jobSource === 'Telegram' && !job.location?.trim();
@@ -519,8 +500,9 @@ export async function scoreJobs(
       callResult = await callScoringLlmWithBackoff(
         systemPrompt,
         buildScoringUserMessage(job, settings.summary_prompt, isSparse),
-        settings.ai_model,
-        openAiKey,
+        model,
+        provider,
+        apiKey,
       );
     } catch (err) {
       // A 429 that reaches here has already exhausted the backoff. Truncating cannot lift a rate
@@ -538,8 +520,9 @@ export async function scoreJobs(
         callResult = await callScoringLlmWithBackoff(
           systemPrompt,
           buildScoringUserMessage(truncated, settings.summary_prompt, isSparse),
-          settings.ai_model,
-          openAiKey,
+          model,
+          provider,
+          apiKey,
         );
       } catch (retryErr) {
         if (isRateLimit(retryErr)) rateLimited = true;
@@ -648,11 +631,10 @@ export async function preFilterDuplicateCandidates(
   newTitle: string,
   candidates: Array<{ id: number; title: string }>,
   model: string,
-  openAiKey: string,
+  provider: AiProvider,
+  apiKey: string,
 ): Promise<number[]> {
   if (candidates.length === 0) return [];
-
-  const client = new OpenAI({ apiKey: openAiKey });
 
   const systemPrompt =
     'You are a job deduplication pre-filter. Given a new job title and a list of existing job titles from the same company, return the IDs of any existing jobs that could plausibly be the same role — same seniority, same domain, same scope. Be liberal: include anything that might be a duplicate. Return only the IDs.';
@@ -662,34 +644,23 @@ export async function preFilterDuplicateCandidates(
     candidates.map((c) => `ID ${c.id}: ${c.title}`).join('\n');
 
   try {
-    const response = await client.responses.create({
+    const client = createAiClient(provider, apiKey);
+    const { result } = await client.generateJson<PreFilterLlmOutput>({
       model,
-      input: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage },
-      ],
-      max_output_tokens: 1000,
-      text: {
-        format: {
-          type: 'json_schema',
-          name: 'pre_filter',
-          strict: true,
-          schema: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              candidate_ids: { type: 'array', items: { type: 'integer' } },
-            },
-            required: ['candidate_ids'],
-          },
+      systemPrompt,
+      userMessage,
+      maxOutputTokens: 1000,
+      schemaName: 'pre_filter',
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          candidate_ids: { type: 'array', items: { type: 'integer' } },
         },
+        required: ['candidate_ids'],
       },
     });
-
-    const text = response.output_text;
-    if (!text) return [];
-    const output = JSON.parse(text) as PreFilterLlmOutput;
-    return output.candidate_ids ?? [];
+    return result.candidate_ids ?? [];
   } catch (err) {
     console.error('[aiScorer] Pre-filter call failed:', (err as Error).message);
     return [];
@@ -702,40 +673,30 @@ export async function dedupAndSummarise(
   scoredJob: ScoredJob,
   existingJobs: ExistingJob[],
   settings: SettingsRow,
-  openAiKey: string,
+  apiKey: string,
 ): Promise<DedupeAndSummaryResult & { tokenUsage: TokenUsage }> {
   const systemPrompt = buildDedupSummarySystemPrompt(settings.dedup_system_prompt);
+  const provider = normalizeAiProvider(settings.ai_provider);
+  const model = resolveAiModel(provider, settings.ai_model_hard, 'hard');
 
   try {
-    const client = new OpenAI({ apiKey: openAiKey });
-    const response = await client.responses.create({
-      model: settings.ai_model_hard,
-      input: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: buildDedupSummaryUserMessage(scoredJob, existingJobs) },
-      ],
-      max_output_tokens: 1000,
-      text: {
-        format: {
-          type: 'json_schema',
-          name: 'dedup_check',
-          strict: true,
-          schema: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              is_duplicate:    { type: 'boolean' },
-              duplicate_of_id: { type: ['integer', 'null'] },
-            },
-            required: ['is_duplicate', 'duplicate_of_id'],
-          },
+    const client = createAiClient(provider, apiKey);
+    const { result: output, usage } = await client.generateJson<DedupSummaryLlmOutput>({
+      model,
+      systemPrompt,
+      userMessage: buildDedupSummaryUserMessage(scoredJob, existingJobs),
+      maxOutputTokens: 1000,
+      schemaName: 'dedup_check',
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          is_duplicate:    { type: 'boolean' },
+          duplicate_of_id: { type: ['integer', 'null'] },
         },
+        required: ['is_duplicate', 'duplicate_of_id'],
       },
     });
-
-    const text = response.output_text;
-    if (!text) throw new Error('Empty dedup response');
-    const output = JSON.parse(text) as DedupSummaryLlmOutput;
 
     const isDuplicate = output.is_duplicate;
     const duplicateOfId = isDuplicate ? (output.duplicate_of_id ?? null) : null;
@@ -743,11 +704,7 @@ export async function dedupAndSummarise(
     return {
       isDuplicate,
       duplicateOfId,
-      tokenUsage: {
-        inputTokens: response.usage?.input_tokens ?? 0,
-        cachedInputTokens: response.usage?.input_tokens_details?.cached_tokens ?? 0,
-        outputTokens: response.usage?.output_tokens ?? 0,
-      },
+      tokenUsage: usage,
     };
   } catch (err) {
     console.error(

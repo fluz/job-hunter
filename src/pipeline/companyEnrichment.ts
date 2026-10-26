@@ -4,13 +4,13 @@
  * per-company and never abort a run.
  */
 
-import OpenAI from 'openai';
 import pLimit from 'p-limit';
 import type { Database, SettingsRow } from '../db';
 import { companyKey } from '../uiHelpers';
 import type { JobPosting, ProviderCompanyData } from './types';
 import type { TokenUsage } from './aiScorer';
-import { openAiGate } from './openAiGate';
+import { aiGate } from './openAiGate';
+import { createAiClient, normalizeAiProvider, resolveAiModel, type AiProvider } from './aiProvider';
 
 const ENRICH_CONCURRENCY = 3;
 
@@ -54,47 +54,29 @@ ${provider}
 async function callEnrichmentLlm(
   userMessage: string,
   model: string,
-  openAiKey: string,
+  provider: AiProvider,
+  apiKey: string,
 ): Promise<{ result: EnrichmentOutput; usage: TokenUsage }> {
-  const client = new OpenAI({ apiKey: openAiKey });
-  const response = await client.responses.create({
+  const client = createAiClient(provider, apiKey);
+  return client.generateJson<EnrichmentOutput>({
     model,
-    input: [
-      { role: 'system', content: COMPANY_ENRICHMENT_PROMPT },
-      { role: 'user', content: userMessage },
-    ],
-    max_output_tokens: 1500,
-    text: {
-      format: {
-        type: 'json_schema',
-        name: 'company_profile',
-        strict: true,
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            short_description: { type: ['string', 'null'], maxLength: 600 },
-            employee_count:    { type: ['integer', 'null'] },
-            employee_range:    { type: ['string', 'null'] },
-            is_agency:         { type: ['boolean', 'null'] },
-            source_note:       { type: 'string', maxLength: 300 },
-          },
-          required: ['short_description', 'employee_count', 'employee_range', 'is_agency', 'source_note'],
-        },
+    systemPrompt: COMPANY_ENRICHMENT_PROMPT,
+    userMessage,
+    maxOutputTokens: 1500,
+    schemaName: 'company_profile',
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        short_description: { type: ['string', 'null'], maxLength: 600 },
+        employee_count:    { type: ['integer', 'null'] },
+        employee_range:    { type: ['string', 'null'] },
+        is_agency:         { type: ['boolean', 'null'] },
+        source_note:       { type: 'string', maxLength: 300 },
       },
+      required: ['short_description', 'employee_count', 'employee_range', 'is_agency', 'source_note'],
     },
   });
-
-  const text = response.output_text;
-  if (!text) throw new Error('Empty response from OpenAI');
-  return {
-    result: JSON.parse(text) as EnrichmentOutput,
-    usage: {
-      inputTokens: response.usage?.input_tokens ?? 0,
-      cachedInputTokens: response.usage?.input_tokens_details?.cached_tokens ?? 0,
-      outputTokens: response.usage?.output_tokens ?? 0,
-    },
-  };
 }
 
 /**
@@ -105,7 +87,7 @@ export async function enrichCompanies(
   db: Database,
   jobs: JobPosting[],
   settings: SettingsRow,
-  openAiKey: string,
+  apiKey: string,
 ): Promise<{ tokenUsage: TokenUsage; enriched: number; failed: number }> {
   const tokenUsage: TokenUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
 
@@ -161,6 +143,7 @@ export async function enrichCompanies(
   console.log(`[enrich] Enriching ${claimed.length} new company/companies`);
 
   const limit = pLimit(ENRICH_CONCURRENCY);
+  const provider = normalizeAiProvider(settings.ai_provider);
   let enriched = 0;
   let failed = 0;
 
@@ -168,8 +151,9 @@ export async function enrichCompanies(
     try {
       const { result, usage } = await callEnrichmentLlm(
         buildUserMessage(c.display, c.data),
-        settings.ai_model,
-        openAiKey,
+        resolveAiModel(provider, settings.ai_model, 'soft'),
+        provider,
+        apiKey,
       );
       tokenUsage.inputTokens += usage.inputTokens;
       tokenUsage.cachedInputTokens += usage.cachedInputTokens;
@@ -244,53 +228,38 @@ export interface ManualCompanyCheck {
 export async function checkAndProfileCompany(
   company: string,
   model: string,
-  openAiKey: string,
+  provider: AiProvider,
+  apiKey: string,
   concurrency: number,
 ): Promise<ManualCompanyCheck> {
-  return openAiGate(openAiKey, model, concurrency, async () => {
-    const client = new OpenAI({ apiKey: openAiKey });
-    const response = await client.responses.create({
+  return aiGate(provider, apiKey, model, concurrency, async () => {
+    const client = createAiClient(provider, apiKey);
+    const { result: parsed, usage } = await client.generateJson<EnrichmentOutput & { name_correction: string | null }>({
       model,
-      input: [
-        { role: 'system', content: COMPANY_ENRICHMENT_PROMPT + '\n\n' + COMPANY_NAME_CHECK_PROMPT },
-        { role: 'user', content: buildUserMessage(company, undefined) },
-      ],
-      max_output_tokens: 1500,
-      text: {
-        format: {
-          type: 'json_schema',
-          name: 'company_profile_checked',
-          strict: true,
-          schema: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              short_description: { type: ['string', 'null'], maxLength: 600 },
-              employee_count:    { type: ['integer', 'null'] },
-              employee_range:    { type: ['string', 'null'] },
-              is_agency:         { type: ['boolean', 'null'] },
-              source_note:       { type: 'string', maxLength: 300 },
-              name_correction:   { type: ['string', 'null'], maxLength: 120 },
-            },
-            required: ['short_description', 'employee_count', 'employee_range', 'is_agency', 'source_note', 'name_correction'],
-          },
+      systemPrompt: COMPANY_ENRICHMENT_PROMPT + '\n\n' + COMPANY_NAME_CHECK_PROMPT,
+      userMessage: buildUserMessage(company, undefined),
+      maxOutputTokens: 1500,
+      schemaName: 'company_profile_checked',
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          short_description: { type: ['string', 'null'], maxLength: 600 },
+          employee_count:    { type: ['integer', 'null'] },
+          employee_range:    { type: ['string', 'null'] },
+          is_agency:         { type: ['boolean', 'null'] },
+          source_note:       { type: 'string', maxLength: 300 },
+          name_correction:   { type: ['string', 'null'], maxLength: 120 },
         },
+        required: ['short_description', 'employee_count', 'employee_range', 'is_agency', 'source_note', 'name_correction'],
       },
     });
-
-    const text = response.output_text;
-    if (!text) throw new Error('Empty response from OpenAI');
-    const parsed = JSON.parse(text) as EnrichmentOutput & { name_correction: string | null };
     const correction = (parsed.name_correction || '').trim();
     return {
       profile: parsed,
       // A "correction" identical to what was typed is not a correction.
       nameCorrection: correction && correction !== company.trim() ? correction : null,
-      usage: {
-        inputTokens: response.usage?.input_tokens ?? 0,
-        cachedInputTokens: response.usage?.input_tokens_details?.cached_tokens ?? 0,
-        outputTokens: response.usage?.output_tokens ?? 0,
-      },
+      usage,
     };
   });
 }

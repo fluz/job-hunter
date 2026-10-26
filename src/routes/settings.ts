@@ -14,6 +14,7 @@ import { emailFrame } from '../pipeline/emailReport';
 import { hashToken } from './auth';
 import { COMPANY_ENRICHMENT_PROMPT, COMPANY_NAME_CHECK_PROMPT } from '../pipeline/companyEnrichment';
 import { describeAccountLimits } from '../pipeline/limitTables';
+import { normalizeAiProvider } from '../pipeline/aiProvider';
 
 const router = Router();
 
@@ -94,7 +95,7 @@ router.get('/', (req: Request, res: Response) => {
   // describe the operator's account rather than the user's — and the block is hidden by CSS, not
   // omitted, so building it at all would put the operator's real ceiling in the page source of
   // every credits user. Caveat C8: that is not theirs to see.
-  const accountLimits = (settings.use_jh_credits ?? 1) === 0
+  const accountLimits = (settings.use_jh_credits ?? 1) === 0 && normalizeAiProvider(settings.ai_provider) === 'openai'
     ? describeAccountLimits(resolveLimits(db, profileId), settings.ai_model)
     : null;
 
@@ -266,12 +267,15 @@ router.post('/', async (req: Request, res: Response) => {
       ];
       if ('ai_model' in body) aiFields.push(['ai_model', String(body.ai_model)]);
       if ('ai_model_hard' in body) aiFields.push(['ai_model_hard', String(body.ai_model_hard)]);
+      if ('ai_provider' in body) aiFields.push(['ai_provider', normalizeAiProvider(String(body.ai_provider))]);
       if ('use_jh_credits' in body) aiFields.push(['use_jh_credits', body.use_jh_credits === '0' ? 0 : 1]);
       if (newDedup) aiFields.push(['dedup_system_prompt', newDedup]);
       if (newSummary) aiFields.push(['summary_prompt', newSummary]);
       if (newCvPrompt) aiFields.push(['cv_comparison_prompt', newCvPrompt]);
       if (newUserApify) aiFields.push(['user_apify_api_token', newUserApify]);
       if (newUserOpenAi) aiFields.push(['user_openai_api_key', newUserOpenAi]);
+      const newUserGemini = String(body.user_gemini_api_key || '').trim();
+      if (newUserGemini) aiFields.push(['user_gemini_api_key', newUserGemini]);
       db.prepare(
         `UPDATE settings SET ${aiFields.map(([c]) => `${c} = ?`).join(', ')} WHERE profile_id = ?`
       ).run(...aiFields.map(([, v]) => v), profileId);

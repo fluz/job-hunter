@@ -34,7 +34,7 @@ import { invalidateJobsDatesCache } from './jobs';
 import { getCompanyProfile, getCompanyUserContext, buildCompanyLinks } from './company';
 import { newStatusId, incomingStatusId, todayIn, profileTimezone, daysSince, listStatuses, statusMap, setJobStatus, recomputeCurrent,
          jobHistory, shortcuts, idsOfTypes, legacyApplied, MAX_STATUSES, MAX_STATUS_NAME, STATUS_TYPES, ASSIGNABLE_TYPES, TYPE_META, type StatusType, type StatusRow } from '../statuses';
-import OpenAI from 'openai';
+import { AI_PROVIDER_LABELS, createAiClient, normalizeAiProvider, resolveAiModel, type AiProvider } from '../pipeline/aiProvider';
 
 const router = Router();
 
@@ -51,24 +51,17 @@ router.get('/preflight', (req: Request, res: Response) => {
     const errors: string[] = [];
 
     const useJhCredits = (settings?.use_jh_credits ?? 1) !== 0;
-    if (useJhCredits) {
-      // Resolving through the chokepoint keeps this advisory check on exactly the same rule the
-      // runner enforces, so the UI can never green-light a run the pipeline will refuse.
-      try {
-        const { openAiKey, apifyToken } = resolveSpendKeys(db, profileId);
-        if (!openAiKey)  errors.push('Global OpenAI API key is not configured — ask admin to add it in Settings → Admin → Global API Keys.');
-        if (!apifyToken) errors.push('Global Apify API token is not configured — ask admin to add it in Settings → Admin → Global API Keys.');
-      } catch (err) {
-        errors.push((err as Error).message);
+    // Resolving through the chokepoint keeps this advisory check on exactly the same rule the
+    // runner enforces, so the UI can never green-light a run the pipeline will refuse.
+    try {
+      const { aiProvider, aiKey, apifyToken } = resolveSpendKeys(db, profileId);
+      const providerLabel = AI_PROVIDER_LABELS[aiProvider];
+      if (!aiKey) errors.push(`${providerLabel} API key is not configured — add it in Settings → AI Setup.`);
+      if (!apifyToken) {
+        errors.push(`${useJhCredits ? 'Global ' : ''}Apify API token is not configured — ${useJhCredits ? 'ask admin to add it in Settings → Admin → Global API Keys.' : 'add it in Settings → AI Setup → Use your own API keys.'}`);
       }
-    } else {
-      // No config.* fallback here: own-keys means the profile's own keys. Falling back to the
-      // instance env vars let a profile run the pipeline on the operator's accounts, unmetered —
-      // credit deduction only happens in credits mode, so that spend left no trace anywhere.
-      const openAiKey = settings?.user_openai_api_key?.trim();
-      const apifyKey  = settings?.user_apify_api_token?.trim();
-      if (!openAiKey) errors.push('OpenAI API key is not set — add it in Settings → AI Setup → Use my own API keys.');
-      if (!apifyKey)  errors.push('Apify API token is not set — add it in Settings → AI Setup → Use my own API keys.');
+    } catch (err) {
+      errors.push((err as Error).message);
     }
 
     if (activeGroups.length === 0) {
@@ -130,7 +123,10 @@ router.post('/run', async (req: Request, res: Response) => {
   // keys — `GET /preflight` only advises the UI, so this handler is the gate. runner.ts repeats
   // the check because a scheduled run never passes through here.
   const db = getDb();
-  const settings = db.prepare('SELECT use_jh_credits, credits_balance, user_openai_api_key, user_apify_api_token FROM settings WHERE profile_id = ?').get(profileId) as { use_jh_credits: number; credits_balance: number; user_openai_api_key: string; user_apify_api_token: string } | undefined;
+  const settings = db.prepare('SELECT use_jh_credits, credits_balance, ai_provider, user_openai_api_key, user_gemini_api_key, user_apify_api_token FROM settings WHERE profile_id = ?').get(profileId) as {
+    use_jh_credits: number; credits_balance: number; ai_provider: string;
+    user_openai_api_key: string; user_gemini_api_key: string; user_apify_api_token: string;
+  } | undefined;
   if ((settings?.use_jh_credits ?? 1) !== 0) {
     const balance = settings?.credits_balance ?? 0;
     if (balance < MIN_RUN_CREDITS) {
@@ -138,7 +134,8 @@ router.post('/run', async (req: Request, res: Response) => {
       return;
     }
   } else if (!isPaymentReady(settings)) {
-    res.status(402).json({ success: false, error: 'Own API keys are not set. Add your OpenAI key and Apify token in Settings → AI Setup, or switch to credits.' });
+    const providerLabel = AI_PROVIDER_LABELS[normalizeAiProvider(settings?.ai_provider)];
+    res.status(402).json({ success: false, error: `Own API keys are not set. Add your ${providerLabel} key and Apify token in Settings → AI Setup, or switch to credits.` });
     return;
   }
 
@@ -327,6 +324,28 @@ router.post('/test/openai', async (req: Request, res: Response) => {
     const m = limits[model];
 
     res.json({ success: true, message: `OpenAI key is valid — scores up to ${m.concurrency} job(s) at once on ${model}.` });
+  } catch (err) {
+    res.status(400).json({ success: false, error: (err as Error).message });
+  }
+});
+
+router.post('/test/gemini', async (req: Request, res: Response) => {
+  const key = String((req.body as Record<string, unknown>).token || '').trim();
+  if (!key) {
+    res.status(400).json({ success: false, error: 'No API key provided.' });
+    return;
+  }
+  try {
+    const client = createAiClient('gemini', key);
+    const { text } = await client.generateText({
+      model: resolveAiModel('gemini', '', 'soft'),
+      userMessage: 'Reply with exactly: ok',
+      maxOutputTokens: 8,
+    });
+    if (text.trim().toLowerCase() !== 'ok') {
+      throw new Error('Key was accepted but the Gemini response was unexpected.');
+    }
+    res.json({ success: true, message: 'Gemini API key is valid.' });
   } catch (err) {
     res.status(400).json({ success: false, error: (err as Error).message });
   }
@@ -560,15 +579,15 @@ router.post('/schedule/start', async (req: Request, res: Response) => {
 
   // Layer 1 already refuses an unfunded run at fire time; this only turns a silent 3am failure into
   // an immediate error. Same wording as POST /api/run so the two gates cannot read differently.
-  const paySettings = db.prepare('SELECT use_jh_credits, credits_balance, user_openai_api_key, user_apify_api_token FROM settings WHERE profile_id = ?').get(profileId) as
-    { use_jh_credits: number; credits_balance: number; user_openai_api_key: string; user_apify_api_token: string } | undefined;
+  const paySettings = db.prepare('SELECT use_jh_credits, credits_balance, ai_provider, user_openai_api_key, user_gemini_api_key, user_apify_api_token FROM settings WHERE profile_id = ?').get(profileId) as
+    { use_jh_credits: number; credits_balance: number; ai_provider: string; user_openai_api_key: string; user_gemini_api_key: string; user_apify_api_token: string } | undefined;
   if (!isPaymentReady(paySettings)) {
     const balance = paySettings?.credits_balance ?? 0;
     res.status(402).json({
       success: false,
       error: (paySettings?.use_jh_credits ?? 1) !== 0
         ? `Insufficient credits ($${balance.toFixed(2)}). Please top up to at least $${MIN_RUN_CREDITS.toFixed(2)} to run.`
-        : 'Own API keys are not set. Add your OpenAI key and Apify token in Settings → AI Setup, or switch to credits.',
+        : `Own API keys are not set. Add your ${AI_PROVIDER_LABELS[normalizeAiProvider(paySettings?.ai_provider)]} key and Apify token in Settings → AI Setup, or switch to credits.`,
     });
     return;
   }
@@ -1563,17 +1582,18 @@ router.post('/company/check', async (req: Request, res: Response) => {
   // 2 — an unknown name. Keys through the same chokepoint as the pipeline, so the $0.50
   // `MIN_RUN_CREDITS` floor and the own-keys rule apply here too. A refusal is not an error: the
   // company is simply created unenriched and the job still saves.
-  let openAiKey: string;
+  let aiProvider: AiProvider;
+  let aiKey: string;
   try {
-    ({ openAiKey } = resolveSpendKeys(db, profileId));
+    ({ aiProvider, aiKey } = resolveSpendKeys(db, profileId));
   } catch (err) {
     res.json({ status: 'unchecked', reason: err instanceof PaymentError ? 'no_credits' : 'failed', name: typed });
     return;
   }
-  if (!openAiKey) { res.json({ status: 'unchecked', reason: 'failed', name: typed }); return; }
+  if (!aiKey) { res.json({ status: 'unchecked', reason: 'failed', name: typed }); return; }
 
   const settings = db.prepare('SELECT * FROM settings WHERE profile_id = ?').get(profileId) as SettingsRow | undefined;
-  const model = settings?.ai_model_hard?.trim() || FALLBACK_AI_MODEL;
+  const model = resolveAiModel(aiProvider, settings?.ai_model_hard?.trim() || FALLBACK_AI_MODEL, 'hard');
   const limits = resolveLimits(db, profileId);
 
   let checked: Awaited<ReturnType<typeof checkAndProfileCompany>>;
@@ -1581,7 +1601,7 @@ router.post('/company/check', async (req: Request, res: Response) => {
     // The timeout races the call rather than aborting it: an in-flight request still releases its
     // gate slot when it settles, and a save must never wait on the model (§3).
     checked = await Promise.race([
-      checkAndProfileCompany(typed, model, openAiKey, limits.openAiConcurrencyFor(model)),
+      checkAndProfileCompany(typed, model, aiProvider, aiKey, limits.aiConcurrencyFor(aiProvider, model)),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), COMPANY_CHECK_TIMEOUT_MS)),
     ]);
   } catch (err) {
@@ -1591,7 +1611,7 @@ router.post('/company/check', async (req: Request, res: Response) => {
     return;
   }
 
-  recordManualAiCost(db, profileId, model, checked.usage);
+  if (aiProvider === 'openai') recordManualAiCost(db, profileId, model, checked.usage);
 
   // 3 — a correction came back. **Always ask.** An earlier draft attached the job silently whenever
   // the corrected name was one we already held, on the reasoning that a correction pointing at a
@@ -2003,68 +2023,35 @@ router.post('/jobs/:id/cv-compare', async (req: Request, res: Response) => {
 
   // Metered like a pipeline run. This call used to fall back to the instance's env key with no
   // balance check and no deduction, which made it a free proxy onto the operator's OpenAI account.
-  let openaiKey: string;
+  let aiProvider: AiProvider;
+  let aiKey: string;
   try {
-    ({ openAiKey: openaiKey } = resolveSpendKeys(db, profileId));
+    ({ aiProvider, aiKey } = resolveSpendKeys(db, profileId));
   } catch (err) {
     res.status(err instanceof PaymentError ? 402 : 400).json({ error: (err as Error).message });
     return;
   }
-  if (!openaiKey) { res.status(400).json({ error: 'OpenAI API key not configured.' }); return; }
+  if (!aiKey) { res.status(400).json({ error: `${AI_PROVIDER_LABELS[aiProvider]} API key not configured.` }); return; }
 
   const prompt = settings?.cv_comparison_prompt?.trim() || DEFAULT_CV_COMPARISON_PROMPT;
-  const model = settings?.ai_model_hard?.trim() || FALLBACK_AI_MODEL;
+  const model = resolveAiModel(aiProvider, settings?.ai_model_hard?.trim() || FALLBACK_AI_MODEL, 'hard');
   const jobText = `JOB TITLE: ${job.title}\nCOMPANY: ${job.company}\nLOCATION: ${job.location || 'N/A'}\nWORK MODE: ${job.work_mode || 'N/A'}\n\nDESCRIPTION:\n${(job.description || '').substring(0, 12000)}`;
 
   try {
-    const client = new OpenAI({ apiKey: openaiKey });
-    let responseText: string;
-    let usage: { input_tokens?: number; output_tokens?: number; input_tokens_details?: { cached_tokens?: number } } | undefined;
+    const client = createAiClient(aiProvider, aiKey);
+    const response = await client.generateText({
+      model,
+      userMessage: cv.mime_type === 'application/pdf'
+        ? `\nHere is the job description:\n\n${jobText}\n\n${prompt}`
+        : `MY CV:\n\n${Buffer.from(cv.content_b64, 'base64').toString('utf-8')}\n\nJOB POSTING:\n\n${jobText}\n\n${prompt}`,
+      file: cv.mime_type === 'application/pdf'
+        ? { filename: cv.filename, mimeType: cv.mime_type, dataBase64: cv.content_b64 }
+        : undefined,
+    });
 
-    if (cv.mime_type === 'application/pdf') {
-      // PDF: send as base64 file input
-      const response = await client.responses.create({
-        model,
-        input: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'input_file' as const,
-                filename: cv.filename,
-                file_data: `data:application/pdf;base64,${cv.content_b64}`,
-              },
-              {
-                type: 'input_text' as const,
-                text: `\nHere is the job description:\n\n${jobText}\n\n${prompt}`,
-              },
-            ],
-          },
-        ],
-      });
-      responseText = response.output_text;
-      usage = response.usage;
-    } else {
-      // Text-based CV
-      const cvText = Buffer.from(cv.content_b64, 'base64').toString('utf-8');
-      const response = await client.responses.create({
-        model,
-        input: [
-          {
-            role: 'user',
-            content: `MY CV:\n\n${cvText}\n\nJOB POSTING:\n\n${jobText}\n\n${prompt}`,
-          },
-        ],
-      });
-      responseText = response.output_text;
-      usage = response.usage;
-    }
-
-    if (!responseText) throw new Error('Empty response from OpenAI');
-
-    db.prepare('UPDATE job_profile_states SET cv_assessment = ? WHERE job_id = ? AND profile_id = ?').run(responseText, jobId, profileId);
-    recordCvCompareCost(db, profileId, model, usage);
-    res.json({ ok: true, assessment: responseText });
+    db.prepare('UPDATE job_profile_states SET cv_assessment = ? WHERE job_id = ? AND profile_id = ?').run(response.text, jobId, profileId);
+    if (aiProvider === 'openai') recordCvCompareCost(db, profileId, model, response.usage);
+    res.json({ ok: true, assessment: response.text });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -2083,14 +2070,14 @@ function recordCvCompareCost(
   db: ReturnType<typeof getDb>,
   profileId: number,
   model: string,
-  usage: { input_tokens?: number; output_tokens?: number; input_tokens_details?: { cached_tokens?: number } } | undefined,
+  usage: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number } | undefined,
 ): void {
   try {
     const cost = calcOpenAiCost(
       model,
-      usage?.input_tokens ?? 0,
-      usage?.input_tokens_details?.cached_tokens ?? 0,
-      usage?.output_tokens ?? 0,
+      usage?.inputTokens ?? 0,
+      usage?.cachedInputTokens ?? 0,
+      usage?.outputTokens ?? 0,
     ) ?? 0;
     if (cost <= 0) return;
 

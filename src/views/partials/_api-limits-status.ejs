@@ -1,10 +1,9 @@
 <%#
   Account limits — read-only, measured, shared by /settings?tab=ai and /admin?tab=general.
 
-  Not a setting. Both providers are asked what they allow (Apify's limits endpoint daily, OpenAI's
-  response headers monthly) and told here in plain terms. There is nothing to choose: a dropdown
-  only ever let someone describe their account wrongly, and the published plan tables it was built
-  from were already out of date.
+  Not a setting.   Apify and OpenAI are asked what they allow (Apify's limits endpoint daily, OpenAI's response
+  headers monthly) and told here in plain terms. Gemini uses a conservative application default and
+  does not show OpenAI limit data here.
 
   On the settings page this sits INSIDE #own-keys-view, so applyKeyMode() hides it in credits mode.
   A credits user's runs are governed by the operator's account, and neither the numbers nor the tier

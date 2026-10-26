@@ -59,9 +59,10 @@ export const APPLIED_TYPES: StatusType[] = STATUS_TYPES.filter((t) => TYPE_META[
  * status held now — New "ever" would be every job, since every job starts at New.
  */
 export const PRESETS: Array<{ id: string; label: string; buckets: Array<'new' | 'dead' | 'applied' | 'live' | 'ended'>; ever: boolean }> = [
-  { id: 'new',   label: 'New',        buckets: ['new'],  ever: false },
-  { id: 'act',   label: 'In Progress', buckets: ['live'], ever: false },
-  { id: 'touch', label: 'Progress History', buckets: ['live'], ever: true },
+  { id: 'new',     label: 'New',              buckets: ['new'],  ever: false },
+  { id: 'applied', label: 'Applied',          buckets: ['applied'], ever: false },
+  { id: 'act',     label: 'In Progress',      buckets: ['live'], ever: false },
+  { id: 'touch',   label: 'Progress History', buckets: ['live'], ever: true },
 ];
 
 /**

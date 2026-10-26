@@ -21,8 +21,8 @@ Each pipeline run (scheduled or manual):
 9. **Email digest** — sends strong matches to your inbox (optional)
 
 Fetching and scoring are both throttled to what your provider accounts actually allow. The app asks
-Apify and OpenAI for their limits and sizes itself from the answer — there is nothing to configure
-(see [Concurrency](#concurrency)).
+Apify and OpenAI for their limits and sizes itself from the answer; Gemini uses a conservative
+application default (see [Concurrency](#concurrency)).
 
 ---
 
@@ -31,7 +31,7 @@ Apify and OpenAI for their limits and sizes itself from the answer — there is 
 | Mode | How it works |
 |---|---|
 | **Hosted** | Use the hosted service against shared keys; runs draw from a prepaid credits balance managed by the operator. |
-| **Own Keys** | Supply your own API keys (job discovery provider + OpenAI); no credits balance involved. |
+| **Own Keys** | Supply your own API keys (job discovery provider + OpenAI or Gemini); no credits balance involved. |
 | **Self-hosted** | Run the open-source code yourself; commercial use not permitted. |
 
 Resource use per run varies by provider selection, number of roles, location breadth, and model choice.
@@ -43,7 +43,7 @@ Resource use per run varies by provider selection, number of roles, location bre
 - **Runtime** — Node.js 22.5+ / TypeScript
 - **Web** — Express 4 + EJS + Tailwind CSS
 - **Database** — SQLite via built-in `node:sqlite`
-- **AI** — OpenAI Responses API (soft model: `gpt-5.4-mini`; hard model: `gpt-5.6-terra`; both configurable per profile)
+- **AI** — OpenAI Responses API or Google Gemini (selectable per profile in Settings → AI Setup)
 - **Job sources** — HarvestAPI, Valig, Indeed, StepStone, Greenhouse, Ashby, Lever, Telegram
 - **Email** — Resend (OTP login + digests)
 - **Scheduler** — node-cron (in-process, survives restarts)
@@ -64,7 +64,8 @@ npm install
 cp .env.example .env
 ```
 ```env
-# Apify/OpenAI here serve hosted-credits mode only — see the note below
+# Apify/OpenAI here serve hosted-credits mode only — see the note below.
+# Gemini is configured per profile in Settings → AI Setup and is available for own-key mode.
 APIFY_API_TOKEN=
 OPENAI_API_KEY=
 RESEND_API_KEY=
@@ -81,8 +82,8 @@ Resend is required for login as well as digests, but the two resolve differently
 Resend key only, with **no `.env` fallback**. Save it in Settings or nobody but the first account
 can sign in.
 
-> **Self-hosting: put your Apify and OpenAI keys in Settings, not `.env`.**
-> Each profile picks a payment mode in **Settings → AI Setup**. On **"Use your own API keys"** — the normal choice when self-hosting — those two keys are read **only** from that profile's saved settings; `.env` is not consulted. If a run is refused with *"Own API keys are not set"*, paste them there.
+> **Self-hosting: put your Apify and AI-provider keys in Settings, not `.env`.**
+> Each profile picks a payment mode and AI provider in **Settings → AI Setup**. On **"Use your own API keys"** — the normal choice when self-hosting — the Apify key and the selected OpenAI or Gemini key are read **only** from that profile's saved settings; `.env` is not consulted. Gemini is not available in hosted-credits mode. If a run is refused with *"Own API keys are not set"*, paste the required keys there.
 > The `.env` values back **hosted-credits** mode instead, where one operator's keys are shared and billed against a credit balance.
 
 **3. Build and run**

@@ -22,7 +22,7 @@
 import { KeyedGate } from './concurrencyGate';
 import { OPENAI_FALLBACK_CONCURRENCY } from './limitTables';
 
-const gate = new KeyedGate('openAiGate', OPENAI_FALLBACK_CONCURRENCY);
+const gate = new KeyedGate('aiGate', OPENAI_FALLBACK_CONCURRENCY);
 
 /**
  * Run `fn` against the budget for this key on this model. `concurrency` is the account's measured
@@ -31,6 +31,17 @@ const gate = new KeyedGate('openAiGate', OPENAI_FALLBACK_CONCURRENCY);
  * The key is part of the Map key and is a secret, so nothing here is ever logged — `KeyedGate`
  * prints only its label and the numbers.
  */
+export function aiGate<T>(
+  provider: string,
+  apiKey: string,
+  model: string,
+  concurrency: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return gate.run(`${provider}::${apiKey}::${model}`, concurrency, fn);
+}
+
+/** Backward-compatible alias for callers that still use the old OpenAI-only name. */
 export function openAiGate<T>(apiKey: string, model: string, concurrency: number, fn: () => Promise<T>): Promise<T> {
-  return gate.run(`${apiKey}::${model}`, concurrency, fn);
+  return aiGate('openai', apiKey, model, concurrency, fn);
 }

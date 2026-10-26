@@ -5,12 +5,12 @@
  */
 
 import { createHash } from 'node:crypto';
-import OpenAI from 'openai';
 import pLimit from 'p-limit';
 import type { Database } from '../db';
 import { populateCountriesFromCache } from './atsPoolFetcher';
 import { resolveLocationSet } from './locationNormalizer';
 import { groupOrDrop } from './locationGrouping';
+import { createAiClient, type AiProvider } from './aiProvider';
 
 export interface ExtractedJob {
   title: string;
@@ -66,50 +66,39 @@ export async function extractJobsFromPost(
   postText: string,
   prompt: string,
   model: string,
-  openAiKey: string,
+  provider: AiProvider,
+  apiKey: string,
 ): Promise<ExtractedJob[]> {
-  const client = new OpenAI({ apiKey: openAiKey });
-  const response = await client.responses.create({
+  const client = createAiClient(provider, apiKey);
+  const { result: parsed } = await client.generateJson<{ jobs: ExtractedJob[] }>({
     model,
-    input: [
-      { role: 'system', content: prompt },
-      { role: 'user', content: postText },
-    ],
-    max_output_tokens: 3000,
-    text: {
-      format: {
-        type: 'json_schema',
-        name: 'telegram_jobs',
-        strict: true,
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            jobs: {
-              type: 'array',
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  title:     { type: 'string' },
-                  company:   { type: ['string', 'null'] },
-                  workMode:  { type: 'string', enum: ['remote', 'hybrid', 'onsite'] },
-                  locations: { type: 'array', items: { type: 'string' } },
-                  applyUrl:  { type: ['string', 'null'] },
-                },
-                required: ['title', 'company', 'workMode', 'locations', 'applyUrl'],
-              },
+    systemPrompt: prompt,
+    userMessage: postText,
+    maxOutputTokens: 3000,
+    schemaName: 'telegram_jobs',
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        jobs: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              title:     { type: 'string' },
+              company:   { type: ['string', 'null'] },
+              workMode:  { type: 'string', enum: ['remote', 'hybrid', 'onsite'] },
+              locations: { type: 'array', items: { type: 'string' } },
+              applyUrl:  { type: ['string', 'null'] },
             },
+            required: ['title', 'company', 'workMode', 'locations', 'applyUrl'],
           },
-          required: ['jobs'],
         },
       },
+      required: ['jobs'],
     },
   });
-
-  const text = response.output_text;
-  if (!text) return [];
-  const parsed = JSON.parse(text) as { jobs: ExtractedJob[] };
   return (parsed.jobs ?? []).filter((j) => j.title?.trim()).map((j) => ({
     ...j,
     workMode: ['remote', 'hybrid', 'onsite'].includes(j.workMode) ? j.workMode : 'onsite',
@@ -191,7 +180,7 @@ export async function runExtraction(
 
     let jobs: ExtractedJob[];
     try {
-      jobs = await extractJobsFromPost(postText, effectivePrompt, model, openAiKey);
+      jobs = await extractJobsFromPost(postText, effectivePrompt, model, 'openai', openAiKey);
     } catch (err) {
       console.error(`[telegram-extract] Failed for post ${post.channel_username}/${post.post_id}:`, (err as Error).message);
       return;

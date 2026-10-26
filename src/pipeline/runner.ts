@@ -24,6 +24,7 @@ import { groupOrDrop } from './locationGrouping';
 import { sendDailyReport, sendLowCreditsEmail, sendRateLimitAlert, type RunStats } from './emailReport';
 import { fetchCompanyLogos } from './companyLogos';
 import { enqueue } from './runQueue';
+import { normalizeAiProvider, resolveAiModel } from './aiProvider';
 
 const lastRateLimitAlert = new Map<string, number>(); // recipient email → last alert timestamp
 const RATE_LIMIT_ALERT_COOLDOWN_MS = 30 * 60_000;
@@ -272,7 +273,10 @@ async function runPipelineInner(trigger: 'scheduled' | 'manual', profileId: numb
     // and refuses the `config.*` fallback in own-keys mode, so a scheduled run — which never passes
     // through `/api/run` — is gated on exactly the same rule as a manual one.
     const useJhCredits = (settings.use_jh_credits ?? 1) !== 0;
-    const { openAiKey, apifyToken } = resolveSpendKeys(db, profileId);
+    const { aiProvider, aiKey, openAiKey, apifyToken } = resolveSpendKeys(db, profileId);
+    // Credits mode is always backed by the operator's OpenAI key, regardless of the profile's
+    // own-key provider preference. Downstream operations read this effective provider from settings.
+    settings.ai_provider = aiProvider;
 
     const resendApiKey = settings.resend_api_key || config.resendApiKey;
     const emailFrom = settings.email_from || config.emailFrom;
@@ -321,14 +325,16 @@ async function runPipelineInner(trigger: 'scheduled' | 'manual', profileId: numb
     // actually use. Both are hard-capped, swallow every error, and back off after a failure, so
     // neither can fail a run or meaningfully delay one. Every run scores, so OpenAI is always
     // measured; Apify only when a provider in this run actually starts an Actor.
-    const scoringModels = [settings.ai_model, settings.ai_model_hard].filter(Boolean);
+    const scoringModels = aiProvider === 'openai'
+      ? [settings.ai_model, settings.ai_model_hard].filter(Boolean)
+      : [];
     const staleModels = scoringModels.filter((m) => isModelLimitStale(limits.openAiLimits, m));
 
     await Promise.all([
       usesApify && limits.apifyDetectionStale
         ? refreshApifyLimits(db, limits.rowId, apifyToken, { honourBackoff: true })
         : Promise.resolve(null),
-      staleModels.length > 0
+      aiProvider === 'openai' && staleModels.length > 0
         ? refreshOpenAiLimits(db, limits.rowId, openAiKey, staleModels, { honourBackoff: true })
         : Promise.resolve(null),
     ]);
@@ -338,8 +344,9 @@ async function runPipelineInner(trigger: 'scheduled' | 'manual', profileId: numb
       `[runner] Limits — Apify ${limits.apifyConcurrency} concurrent` +
       `${limits.apifyConcurrencyDetected ? ` (account reports ${limits.apifyConcurrencyDetected})` : ' (not measured)'}` +
       `${usesApify ? '' : ' [unused: no Apify provider in this run]'}, ` +
-      `OpenAI ${scoringModels.map((m) => `${m}=${limits.openAiConcurrencyFor(m)}`).join(' ')}` +
-      `${limits.openAiTier ? ` (${limits.openAiTier})` : ''}`,
+      `${aiProvider === 'openai'
+        ? `OpenAI ${scoringModels.map((m) => `${m}=${limits.openAiConcurrencyFor(m)}`).join(' ')}${limits.openAiTier ? ` (${limits.openAiTier})` : ''}`
+        : `Gemini ${resolveAiModel(aiProvider, settings.ai_model, 'soft')}=${limits.aiConcurrencyFor(aiProvider, resolveAiModel(aiProvider, settings.ai_model, 'soft'))}`}`,
     );
 
     console.log(`[runner] Starting pipeline (${trigger}) — ${groups.length} group(s), ${blacklist.length} blacklisted company(ies), ${providers.length} provider(s)`);
@@ -805,7 +812,7 @@ async function runPipelineInner(trigger: 'scheduled' | 'manual', profileId: numb
       if (newJobsToScore.length > 0) {
         throwIfStopped(profileId);
         try {
-          const enr = await enrichCompanies(db, newJobsToScore, settings, openAiKey);
+          const enr = await enrichCompanies(db, newJobsToScore, settings, aiKey);
           totalInputTokens       += enr.tokenUsage.inputTokens;
           totalCachedInputTokens += enr.tokenUsage.cachedInputTokens;
           totalOutputTokens      += enr.tokenUsage.outputTokens;
@@ -829,7 +836,7 @@ async function runPipelineInner(trigger: 'scheduled' | 'manual', profileId: numb
       if (newJobsToScore.length > 0) {
         setStage(profileId, `${providerPrefix}${roleLabel}: Scoring with AI`, Math.round((globalSectionOffset + activeGroupIdx * 2 + 2) * sw), globalTotalSections,
           { providerIdx: providerIdx + 1, providerCount: providers.length, providerName: providerToSource(scrapingProvider), roleIdx: activeGroupIdx + 1, roleCount: activeGroups.length, roleLabel, action: 'Scoring with AI' });
-        const scoreResult = await scoreJobs(newJobsToScore, scoringSettings, openAiKey, limits);
+        const scoreResult = await scoreJobs(newJobsToScore, scoringSettings, aiKey, limits);
         scoredJobs = scoreResult.jobs;
         jobsScored += scoredJobs.length;
         if (scoreResult.failed > 0) {
@@ -899,8 +906,9 @@ async function runPipelineInner(trigger: 'scheduled' | 'manual', profileId: numb
             const filteredIds = await preFilterDuplicateCandidates(
               scored.job.title,
               allCandidates.map((c) => ({ id: c.id, title: c.title })),
-              settings.ai_model,
-              openAiKey,
+              resolveAiModel(normalizeAiProvider(settings.ai_provider), settings.ai_model, 'soft'),
+              normalizeAiProvider(settings.ai_provider),
+              aiKey,
             );
 
             if (filteredIds.length > 0) {
@@ -912,7 +920,7 @@ async function runPipelineInner(trigger: 'scheduled' | 'manual', profileId: numb
 
               if (dedupCandidates.length > 0) {
                 // Stage 3: full dedup with descriptions
-                const dedup = await dedupAndSummarise(scored, dedupCandidates, settings, openAiKey);
+                const dedup = await dedupAndSummarise(scored, dedupCandidates, settings, aiKey);
                 isDuplicate = dedup.isDuplicate;
                 duplicateOfId = dedup.duplicateOfId && dedup.duplicateOfId > 0 ? dedup.duplicateOfId : null;
                 hardInputTokens += dedup.tokenUsage.inputTokens;
@@ -1183,7 +1191,7 @@ async function runPipelineInner(trigger: 'scheduled' | 'manual', profileId: numb
       await Promise.all(strongMatchesForReScoring.map((entry) => (async () => {
         try {
           const hardSettings: SettingsRow = { ...entry.scoringSettings, ai_model: settings.ai_model_hard };
-          const result = await scoreJobs([entry.job], hardSettings, openAiKey, limits);
+          const result = await scoreJobs([entry.job], hardSettings, aiKey, limits, 'hard');
           if (result.failed > 0 || !result.jobs[0]) {
             jobsFailed += 1;
             errors.push(`Re-score failed for "${entry.job.title}" at "${entry.job.company}": ${result.firstError ?? 'no result'}`);

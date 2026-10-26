@@ -7,7 +7,16 @@
           class="jh-card stg-cardpad">
       <input type="hidden" name="tab" value="ai">
       <div class="stg-h2" style="margin-bottom:3px">API Keys</div>
-      <p class="stg-sub" style="margin-bottom:18px">Choose whether to run on Job Search credits or on your own API keys.</p>
+      <p class="stg-sub" style="margin-bottom:18px">Choose the AI provider for scoring and analysis, then choose whether to run on Job Search credits or your own API keys. Job-source scrapers are configured separately.</p>
+
+      <div class="stg-panel" style="margin-bottom:18px">
+        <label class="stg-label" for="ai-provider-select">AI provider</label>
+        <select id="ai-provider-select" name="ai_provider" class="stg-ctl" style="max-width:288px" onchange="window.applyAiProvider && window.applyAiProvider(this.value)">
+          <option value="openai" <%= settings.use_jh_credits || settings.ai_provider === 'openai' || !settings.ai_provider ? 'selected' : '' %>>OpenAI</option>
+          <option value="gemini" <%= !settings.use_jh_credits && settings.ai_provider === 'gemini' ? 'selected' : '' %> <%= settings.use_jh_credits ? 'disabled' : '' %>>Google Gemini (own keys only)</option>
+        </select>
+        <p class="stg-hint" style="margin-top:6px">This controls AI scoring, deduplication, summaries, enrichment, and CV comparison.</p>
+      </div>
 
       <!-- Mode choice -->
       <div class="stg-panel" style="margin-bottom:18px">
@@ -35,7 +44,7 @@
             </span>
             <span>
               <span class="block text-gray-900" style="font-size:13.5px;font-weight:700;margin-bottom:2px">Use your own keys</span>
-              <span class="block text-xs text-gray-600 leading-snug">You pay Apify and OpenAI directly. Bring your own tokens.</span>
+              <span class="block text-xs text-gray-600 leading-snug">You pay Apify and the selected AI provider directly. Bring your own tokens.</span>
             </span>
           </button>
         </div>
@@ -95,7 +104,35 @@
               <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
             </a>
           </div>
-          <div class="flex gap-2">
+
+          <!-- Gemini -->
+          <div id="own-gemini-key-block" class="hidden">
+            <div class="flex items-center gap-1.5 mb-1.5">
+              <label style="font-size:12px;font-weight:600;color:var(--muted)">Gemini API Key <span class="stg-req">*</span></label>
+              <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer"
+                 class="text-gray-400 hover:text-blue-500 transition-colors" title="Get your Gemini API key">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 3v18M3 12h18"/></svg>
+              </a>
+            </div>
+            <div class="flex gap-2">
+              <div class="relative flex-1">
+                <input id="user-gemini-key-input" type="password" name="user_gemini_api_key" value="<%= settings.user_gemini_api_key || '' %>"
+                       class="stg-ctl mono" style="padding-right:38px"
+                       placeholder="AIza…" autocomplete="off" />
+                <button type="button" onclick="toggleEye('user-gemini-key-input', this)"
+                        class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7 9.542 7"/></svg>
+                </button>
+              </div>
+              <button type="button" onclick="testApiKey('gemini', 'user-gemini-key-input', 'user-gemini-test-status')"
+                      class="stg-btn stg-btn-secondary stg-btn-sm" style="flex:none">
+                Test key
+              </button>
+            </div>
+            <p id="user-gemini-test-status" class="text-xs mt-1.5 hidden"></p>
+          </div>
+            <div id="own-openai-key-block">
+            <div class="flex gap-2">
             <div class="relative flex-1">
               <input id="user-openai-key-input" type="password" name="user_openai_api_key" value="<%= settings.user_openai_api_key %>"
                      class="stg-ctl mono" style="padding-right:38px"
@@ -111,6 +148,7 @@
             </button>
           </div>
           <p id="user-openai-test-status" class="text-xs mt-1.5 hidden"></p>
+          </div>
         </div>
 
         <div style="border-top:1px solid var(--line);padding-top:16px">
@@ -136,7 +174,7 @@
       <button type="button" onclick="togglePromptBlock('llm-models-body', 'llm-models-chevron')" class="stg-coll-head">
         <div>
           <div class="stg-h2">LLM models</div>
-          <p class="stg-sub">Which model handles the easy and the hard AI tasks.</p>
+          <p class="stg-sub">Choose separate models for easy and hard AI tasks. The available models change with the selected AI provider.</p>
         </div>
         <svg id="llm-models-chevron" class="stg-coll-chev" width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
@@ -145,18 +183,28 @@
       <div id="llm-models-body" class="hidden stg-coll-body space-y-3">
         <div>
           <label class="stg-label">Easy tasks model <span style="font-weight:500;color:var(--faintest)">— initial scoring, dedup pre-filter</span></label>
-          <select name="ai_model" class="stg-ctl" style="max-width:288px">
-            <option value="gpt-5.6-luna"  <%= settings.ai_model === 'gpt-5.6-luna'  ? 'selected' : '' %>>GPT-5.6 Luna (fastest, most cost-efficient)</option>
-            <option value="gpt-5.4-mini"  <%= settings.ai_model === 'gpt-5.4-mini'  ? 'selected' : '' %>>gpt-5.4-mini (fast, cost-efficient)</option>
-            <option value="gpt-5.6-terra" <%= settings.ai_model === 'gpt-5.6-terra' ? 'selected' : '' %>>GPT-5.6 Terra (highest accuracy)</option>
+          <select id="ai-soft-model" name="ai_model" class="stg-ctl" style="max-width:288px">
+            <option value="gpt-5.6-luna" data-ai-provider="openai" <%= settings.ai_model === 'gpt-5.6-luna' ? 'selected' : '' %>>GPT-5.6 Luna (fastest, most cost-efficient)</option>
+            <option value="gpt-5.4-mini" data-ai-provider="openai" <%= settings.ai_model === 'gpt-5.4-mini' ? 'selected' : '' %>>gpt-5.4-mini (fast, cost-efficient)</option>
+            <option value="gpt-5.6-terra" data-ai-provider="openai" <%= settings.ai_model === 'gpt-5.6-terra' ? 'selected' : '' %>>GPT-5.6 Terra (highest accuracy)</option>
+            <option value="gemini-3.8-flash" data-ai-provider="gemini" <%= settings.ai_model === 'gemini-3.8-flash' ? 'selected' : '' %>>Gemini 3.8 Flash (recommended)</option>
+            <option value="gemini-3.6-flash" data-ai-provider="gemini" <%= settings.ai_model === 'gemini-3.6-flash' ? 'selected' : '' %>>Gemini 3.6 Flash</option>
+            <option value="gemini-3.5-flash-lite" data-ai-provider="gemini" <%= settings.ai_model === 'gemini-3.5-flash-lite' ? 'selected' : '' %>>Gemini 3.5 Flash-Lite (lowest cost)</option>
+            <option value="gemini-3.1-flash-lite" data-ai-provider="gemini" <%= settings.ai_model === 'gemini-3.1-flash-lite' ? 'selected' : '' %>>Gemini 3.1 Flash-Lite</option>
+            <option value="gemini-3.1-pro-preview" data-ai-provider="gemini" <%= settings.ai_model === 'gemini-3.1-pro-preview' ? 'selected' : '' %>>Gemini 3.1 Pro (advanced reasoning)</option>
           </select>
         </div>
         <div>
           <label class="stg-label">Hard tasks model <span style="font-weight:500;color:var(--faintest)">— strong match re-validation, full dedup, CV comparison</span></label>
-          <select name="ai_model_hard" class="stg-ctl" style="max-width:288px">
-            <option value="gpt-5.6-luna"  <%= settings.ai_model_hard === 'gpt-5.6-luna'  ? 'selected' : '' %>>GPT-5.6 Luna (fastest, most cost-efficient)</option>
-            <option value="gpt-5.4-mini"  <%= settings.ai_model_hard === 'gpt-5.4-mini'  ? 'selected' : '' %>>gpt-5.4-mini (fast, cost-efficient)</option>
-            <option value="gpt-5.6-terra" <%= settings.ai_model_hard === 'gpt-5.6-terra' ? 'selected' : '' %>>GPT-5.6 Terra (highest accuracy)</option>
+          <select id="ai-hard-model" name="ai_model_hard" class="stg-ctl" style="max-width:288px">
+            <option value="gpt-5.6-luna" data-ai-provider="openai" <%= settings.ai_model_hard === 'gpt-5.6-luna' ? 'selected' : '' %>>GPT-5.6 Luna (fastest, most cost-efficient)</option>
+            <option value="gpt-5.4-mini" data-ai-provider="openai" <%= settings.ai_model_hard === 'gpt-5.4-mini' ? 'selected' : '' %>>gpt-5.4-mini (fast, cost-efficient)</option>
+            <option value="gpt-5.6-terra" data-ai-provider="openai" <%= settings.ai_model_hard === 'gpt-5.6-terra' ? 'selected' : '' %>>GPT-5.6 Terra (highest accuracy)</option>
+            <option value="gemini-3.8-flash" data-ai-provider="gemini" <%= settings.ai_model_hard === 'gemini-3.8-flash' ? 'selected' : '' %>>Gemini 3.8 Flash (recommended)</option>
+            <option value="gemini-3.6-flash" data-ai-provider="gemini" <%= settings.ai_model_hard === 'gemini-3.6-flash' ? 'selected' : '' %>>Gemini 3.6 Flash</option>
+            <option value="gemini-3.5-flash-lite" data-ai-provider="gemini" <%= settings.ai_model_hard === 'gemini-3.5-flash-lite' ? 'selected' : '' %>>Gemini 3.5 Flash-Lite (lowest cost)</option>
+            <option value="gemini-3.1-flash-lite" data-ai-provider="gemini" <%= settings.ai_model_hard === 'gemini-3.1-flash-lite' ? 'selected' : '' %>>Gemini 3.1 Flash-Lite</option>
+            <option value="gemini-3.1-pro-preview" data-ai-provider="gemini" <%= settings.ai_model_hard === 'gemini-3.1-pro-preview' ? 'selected' : '' %>>Gemini 3.1 Pro (advanced reasoning)</option>
           </select>
         </div>
         <div class="flex items-center gap-3 pt-2">
@@ -717,10 +765,38 @@ Description: {description — up to 1,500 chars each}
       var inp      = document.getElementById('use-jh-credits-input');
       var apifyInp = document.getElementById('user-apify-token-input');
       var openaiInp= document.getElementById('user-openai-key-input');
+      var geminiInp= document.getElementById('user-gemini-key-input');
+      var providerInp = document.getElementById('ai-provider-select');
+      var openaiBlock = document.getElementById('own-openai-key-block');
+      var geminiBlock = document.getElementById('own-gemini-key-block');
       var actions  = document.getElementById('ai-keys-actions');
       var saveBtn  = document.getElementById('ai-keys-save-btn');
       var saveLabel= document.getElementById('ai-keys-save-label');
       var saveHint = document.getElementById('ai-keys-save-hint');
+      var softModel = document.getElementById('ai-soft-model');
+      var hardModel = document.getElementById('ai-hard-model');
+
+      function applyModelOptions(provider) {
+        var isGemini = provider === 'gemini';
+        [softModel, hardModel].forEach(function(select) {
+          if (!select) return;
+          var options = Array.from(select.options);
+          options.forEach(function(option) {
+            var visible = option.dataset.aiProvider === (isGemini ? 'gemini' : 'openai');
+            option.hidden = !visible;
+            option.disabled = !visible;
+          });
+          var current = options.find(function(option) {
+            return !option.disabled && option.value === select.value;
+          });
+          if (!current) {
+            var fallback = isGemini
+              ? (select === hardModel ? 'gemini-3.8-flash' : 'gemini-3.8-flash')
+              : (select === hardModel ? 'gpt-5.6-terra' : 'gpt-5.4-mini');
+            select.value = fallback;
+          }
+        });
+      }
 
       function applyKeyMode(useJh) {
         jhBtn.setAttribute('aria-pressed', String(useJh));
@@ -728,9 +804,20 @@ Description: {description — up to 1,500 chars each}
         jhView.classList.toggle('hidden', !useJh);
         ownView.classList.toggle('hidden', useJh);
         inp.value = useJh ? '1' : '0';
+        if (useJh && providerInp && providerInp.value === 'gemini') providerInp.value = 'openai';
         if (apifyInp) apifyInp.required = !useJh;
-        if (openaiInp) openaiInp.required = !useJh;
+        applyAiProvider(providerInp ? providerInp.value : 'openai');
       }
+
+      window.applyAiProvider = function(provider) {
+        var isGemini = provider === 'gemini' && (!inp || inp.value !== '1');
+        if (openaiBlock) openaiBlock.classList.toggle('hidden', isGemini);
+        if (geminiBlock) geminiBlock.classList.toggle('hidden', !isGemini);
+        if (openaiInp) openaiInp.required = !inp || (inp.value !== '1' && !isGemini);
+        if (geminiInp) geminiInp.required = !inp || (inp.value !== '1' && isGemini);
+        applyModelOptions(isGemini ? 'gemini' : 'openai');
+        refreshKeysSave();
+      };
 
       // Save appears only when the block differs from what's saved.
       function refreshKeysSave() {
@@ -743,7 +830,7 @@ Description: {description — up to 1,500 chars each}
         saveLabel.textContent = useJh ? "Use Misha's credits" : 'Use my keys';
         saveHint.textContent = useJh
           ? 'Scoring will use your credits balance.'
-          : 'Runs will use your Apify and OpenAI keys.';
+          : 'Runs will use your Apify and selected AI provider key.';
       }
       window.refreshKeysSave = refreshKeysSave;
 
@@ -758,11 +845,13 @@ Description: {description — up to 1,500 chars each}
         refreshKeysSave();
       };
 
-      [apifyInp, openaiInp].forEach(function(el) {
+      [apifyInp, openaiInp, geminiInp, providerInp].forEach(function(el) {
         if (el) el.addEventListener('input', refreshKeysSave);
       });
+      if (providerInp) providerInp.addEventListener('change', function() { window.applyAiProvider(this.value); });
 
       applyKeyMode(<%= settings.use_jh_credits ? 'true' : 'false' %>);
+      window.applyAiProvider(providerInp ? providerInp.value : 'openai');
     })();
 
     // ---- Top-up request ----

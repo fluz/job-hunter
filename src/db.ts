@@ -15,6 +15,7 @@ import { config } from './config';
 import ALL_COUNTRIES from './pipeline/countries.json';
 import { apifyConcurrencyFromCeiling, APIFY_FALLBACK_CONCURRENCY, OPENAI_FALLBACK_CONCURRENCY } from './pipeline/limitTables';
 import { parseOpenAiLimits, type OpenAiLimitsMap } from './pipeline/openAiLimits';
+import { DEFAULT_AI_PROVIDER, normalizeAiProvider, type AiProvider } from './pipeline/aiProvider';
 
 export const DEFAULT_PROVIDER_SELECTION = ['valig', 'greenhouse', 'ashby', 'lever', 'telegram'] as const;
 export const DEFAULT_PROVIDER_SELECTION_JSON = JSON.stringify(DEFAULT_PROVIDER_SELECTION);
@@ -1151,6 +1152,21 @@ function runMigrations(db: Database): void {
     console.warn('[db] Migration v_credits failed (non-fatal):', (err as Error).message);
   }
 
+  // v_ai_provider: profile-selected AI backend and Gemini own-key support
+  try {
+    const cols = db.prepare(`PRAGMA table_info(settings)`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === 'ai_provider')) {
+      db.exec(`ALTER TABLE settings ADD COLUMN ai_provider TEXT NOT NULL DEFAULT '${DEFAULT_AI_PROVIDER}'`);
+      console.log('[db] Migration v_ai_provider: settings.ai_provider added');
+    }
+    if (!cols.some((c) => c.name === 'user_gemini_api_key')) {
+      db.exec(`ALTER TABLE settings ADD COLUMN user_gemini_api_key TEXT NOT NULL DEFAULT ''`);
+      console.log('[db] Migration v_ai_provider: settings.user_gemini_api_key added');
+    }
+  } catch (err) {
+    console.warn('[db] Migration v_ai_provider failed (non-fatal):', (err as Error).message);
+  }
+
   // v_company_enrich: shared company basics for the company details modal.
   // fetched_at stays the logo-fetch date (bumped on every logo upsert); enriched_at is the
   // separate "company info saved" date shown in the modal.
@@ -1380,12 +1396,13 @@ function runMigrations(db: Database): void {
           apply_url       TEXT,
           posted_date     TEXT,
           country         TEXT,
+          salary          TEXT,
           fetched_at      TEXT    NOT NULL
         )`);
         db.exec(`INSERT INTO jobs_new
           SELECT id, linkedin_job_id, job_source, provider,
                  title, company, location, work_mode, description,
-                 url, apply_url, posted_date, country, fetched_at
+                 url, apply_url, posted_date, country, salary, fetched_at
           FROM jobs`);
         db.exec(`DROP TABLE jobs`);
         db.exec(`ALTER TABLE jobs_new RENAME TO jobs`);
@@ -2945,6 +2962,7 @@ function initSchema(db: Database): void {
       ai_system_prompt       TEXT    NOT NULL DEFAULT '',
       ai_model               TEXT    NOT NULL DEFAULT 'gpt-5.4-mini',
       ai_model_hard          TEXT    NOT NULL DEFAULT 'gpt-5.6-terra',
+      ai_provider            TEXT    NOT NULL DEFAULT 'openai',
       dedup_system_prompt    TEXT    NOT NULL DEFAULT '',
       score_no_match_max     INTEGER NOT NULL DEFAULT 50,
       score_weak_match_max   INTEGER NOT NULL DEFAULT 70,
@@ -3326,11 +3344,16 @@ export function touchProfileActivity(db: Database, profileId: number): void {
 export function isPaymentReady(s: {
   use_jh_credits?: number;
   credits_balance?: number;
+  ai_provider?: string;
   user_openai_api_key?: string;
+  user_gemini_api_key?: string;
   user_apify_api_token?: string;
 } | undefined): boolean {
   if ((s?.use_jh_credits ?? 1) === 0) {
-    return !!(s?.user_openai_api_key?.trim() && s?.user_apify_api_token?.trim());
+    const aiKey = normalizeAiProvider(s?.ai_provider) === 'gemini'
+      ? s?.user_gemini_api_key
+      : s?.user_openai_api_key;
+    return !!(aiKey?.trim() && s?.user_apify_api_token?.trim());
   }
   return (s?.credits_balance ?? 0) >= MIN_RUN_CREDITS;
 }
@@ -3345,13 +3368,15 @@ export class PaymentError extends Error {
 }
 
 /** The operator's global keys: admin's saved settings, falling back to the env vars (PRD §7.12). */
-function adminKeys(db: Database): { openAiKey: string; apifyToken: string } {
+function adminKeys(db: Database): { aiProvider: AiProvider; aiKey: string; openAiKey: string; apifyToken: string } {
   const admin = db.prepare('SELECT id FROM profiles WHERE is_admin = 1 LIMIT 1').get() as { id: number } | undefined;
   const s = admin
     ? db.prepare('SELECT openai_api_key, apify_api_token FROM settings WHERE profile_id = ?').get(admin.id) as
         { openai_api_key: string; apify_api_token: string } | undefined
     : undefined;
   return {
+    aiProvider: 'openai',
+    aiKey: s?.openai_api_key?.trim() || config.openAiKey || '',
     openAiKey:  s?.openai_api_key?.trim()  || config.openAiKey     || '',
     apifyToken: s?.apify_api_token?.trim() || config.apifyApiToken || '',
   };
@@ -3372,24 +3397,37 @@ function adminKeys(db: Database): { openAiKey: string; apifyToken: string } {
  *
  * Throws `PaymentError`; callers must not treat that as a transient failure.
  */
-export function resolveSpendKeys(db: Database, profileId: number): { openAiKey: string; apifyToken: string } {
+export function resolveSpendKeys(db: Database, profileId: number): {
+  aiProvider: AiProvider;
+  aiKey: string;
+  openAiKey: string;
+  apifyToken: string;
+} {
   const s = db.prepare(`
-    SELECT use_jh_credits, credits_balance, user_openai_api_key, user_apify_api_token
+    SELECT use_jh_credits, credits_balance, ai_provider, user_openai_api_key,
+           user_gemini_api_key, user_apify_api_token
     FROM settings WHERE profile_id = ?
   `).get(profileId) as {
     use_jh_credits: number; credits_balance: number;
-    user_openai_api_key: string; user_apify_api_token: string;
+    ai_provider: string; user_openai_api_key: string; user_gemini_api_key: string; user_apify_api_token: string;
   } | undefined;
 
   if ((s?.use_jh_credits ?? 1) === 0) {
-    const openAiKey  = s?.user_openai_api_key?.trim() || '';
+    const aiProvider = normalizeAiProvider(s?.ai_provider);
+    const aiKey = (aiProvider === 'gemini' ? s?.user_gemini_api_key : s?.user_openai_api_key)?.trim() || '';
     const apifyToken = s?.user_apify_api_token?.trim() || '';
-    if (!openAiKey || !apifyToken) {
+    if (!aiKey || !apifyToken) {
+      const providerLabel = aiProvider === 'gemini' ? 'Gemini' : 'OpenAI';
       throw new PaymentError(
-        'Own API keys are not set. Add your OpenAI key and Apify token in Settings → AI Setup, or switch to credits.',
+        `Own API keys are not set. Add your ${providerLabel} key and Apify token in Settings → AI Setup, or switch to credits.`,
       );
     }
-    return { openAiKey, apifyToken };
+    return {
+      aiProvider,
+      aiKey,
+      openAiKey: aiProvider === 'openai' ? aiKey : '',
+      apifyToken,
+    };
   }
 
   const balance = s?.credits_balance ?? 0;
@@ -3428,6 +3466,8 @@ export interface ResolvedLimits {
 
   /** Concurrent scoring calls allowed for a given model. Falls back conservatively. */
   openAiConcurrencyFor(model: string): number;
+  /** Concurrent AI calls for the selected backend. Gemini uses the conservative fallback. */
+  aiConcurrencyFor(provider: AiProvider, model: string): number;
 }
 
 /**
@@ -3494,6 +3534,11 @@ export function resolveLimits(db: Database, profileId: number): ResolvedLimits {
       const override = Number(process.env.SCORING_CONCURRENCY);
       if (override > 0) return override;
       return openAiLimits[model]?.concurrency || OPENAI_FALLBACK_CONCURRENCY;
+    },
+    aiConcurrencyFor(provider: AiProvider, model: string): number {
+      if (provider === 'openai') return this.openAiConcurrencyFor(model);
+      const override = Number(process.env.SCORING_CONCURRENCY);
+      return override > 0 ? override : OPENAI_FALLBACK_CONCURRENCY;
     },
   };
 }
@@ -3657,6 +3702,7 @@ export interface SettingsRow {
   ai_system_prompt: string;
   ai_model: string;
   ai_model_hard: string;
+  ai_provider: AiProvider;
   dedup_system_prompt: string;
   summary_prompt: string;
   score_no_match_max: number;
@@ -3699,6 +3745,7 @@ export interface SettingsRow {
   use_jh_credits: number;          // 1 = use JH credits (global admin keys), 0 = use own keys
   user_apify_api_token: string;    // user-specific Apify key (used when use_jh_credits = 0)
   user_openai_api_key: string;     // user-specific OpenAI key (used when use_jh_credits = 0)
+  user_gemini_api_key: string;     // user-specific Gemini key (used when use_jh_credits = 0)
   credits_balance: number;         // USD balance when using JH credits
   credits_overspent_usd: number;   // running total of spend the balance could not cover
   app_url: string;                 // deployment base URL used in email links (e.g. https://hunter.example.com)
