@@ -89,6 +89,37 @@ function requireResponseText(text: string | undefined, provider: AiProvider): st
 }
 
 const GEMINI_MAX_ATTEMPTS = 3;
+const GEMINI_REQUESTS_PER_MINUTE = 5;
+const GEMINI_WINDOW_MS = 60_000;
+
+class GeminiRequestLimiter {
+  private readonly timestamps = new Map<string, number[]>();
+  private readonly waiters = new Map<string, Promise<void>>();
+
+  async wait(key: string): Promise<void> {
+    const previous = this.waiters.get(key) ?? Promise.resolve();
+    const next = previous.then(async () => {
+      for (;;) {
+        const now = Date.now();
+        const recent = (this.timestamps.get(key) ?? []).filter((timestamp) => now - timestamp < GEMINI_WINDOW_MS);
+        if (recent.length < GEMINI_REQUESTS_PER_MINUTE) {
+          recent.push(now);
+          this.timestamps.set(key, recent);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.max(50, GEMINI_WINDOW_MS - (now - recent[0]) + 25)));
+      }
+    });
+    this.waiters.set(key, next);
+    try {
+      await next;
+    } finally {
+      if (this.waiters.get(key) === next) this.waiters.delete(key);
+    }
+  }
+}
+
+const geminiRequestLimiter = new GeminiRequestLimiter();
 
 function isTransientGeminiError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
@@ -159,8 +190,10 @@ class OpenAiClient implements AiClient {
 class GeminiClient implements AiClient {
   readonly provider = 'gemini' as const;
   private readonly client: GoogleGenAI;
+  private readonly apiKey: string;
 
   constructor(apiKey: string) {
+    this.apiKey = apiKey;
     this.client = new GoogleGenAI({ apiKey });
   }
 
@@ -190,6 +223,7 @@ class GeminiClient implements AiClient {
       : request.userMessage;
     for (let attempt = 1; ; attempt += 1) {
       try {
+        await geminiRequestLimiter.wait(`${this.apiKey}:${request.model}`);
         return await this.client.models.generateContent({ model: request.model, contents, config });
       } catch (error) {
         if (attempt >= GEMINI_MAX_ATTEMPTS || !isTransientGeminiError(error)) throw error;
