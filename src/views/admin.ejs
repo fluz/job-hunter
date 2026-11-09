@@ -46,7 +46,7 @@
     <input type="hidden" name="section" value="keys">
     <div class="jh-card p-4 sm:p-6">
       <h2 class="text-base font-semibold text-gray-900 mb-1">Global API Keys</h2>
-      <p class="text-xs text-gray-500 mb-4">Used by all users who are on "Use JH credits" mode. Only visible to admin.</p>
+      <p class="text-xs text-gray-500 mb-4">Used by all users who are on "Use JH credits" mode. Hosted credits currently use the operator's OpenAI key; Gemini is available only with profile-owned keys. Only visible to admin.</p>
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
         <div>
           <div class="flex items-center gap-1 mb-1">
@@ -205,7 +205,7 @@
           <% } %>
           <% if (p.has_own_keys) { %>
           <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium flex-shrink-0"
-                title="Own OpenAI + Apify keys are saved on this profile. Saved, not validated — and not necessarily in use: the payment mode decides that.">keys saved</span>
+                title="Own <%= p.ai_provider === 'gemini' ? 'Google Gemini' : 'OpenAI' %> + Apify keys are saved on this profile. Saved, not validated — and not necessarily in use: the payment mode decides that.">keys saved</span>
           <% } %>
         </div>
         <div class="flex items-center justify-between gap-2 sm:contents">
@@ -743,7 +743,7 @@
         <div class="sp-kpi-n"><%= totals.ownKeys.toLocaleString('en-US') %></div>
         <% if (totalUsers > 0) { %><span class="sp-kpi-of"><%= Math.round(totals.ownKeys / totalUsers * 100) %>%</span><% } %>
       </div>
-      <div class="sp-kpi-sub">Both keys saved</div>
+      <div class="sp-kpi-sub">Selected AI-provider key and Apify token saved</div>
     </div>
     <div class="sp-card sp-kpi-left">
       <div class="sp-kpi-l" style="margin-top:0">Activated</div>

@@ -1,6 +1,7 @@
 /**
- * Backfill / regenerate AI product summaries (gpt-5.2) for all STRONG_MATCH
- * non-duplicate jobs. Run from project root:
+ * Backfill / regenerate AI product summaries with OpenAI (gpt-5.2) for all
+ * STRONG_MATCH non-duplicate jobs. This maintenance script is OpenAI-only and
+ * does not use the profile's selected AI provider. Run from project root:
  *   node scripts/backfill-summaries.js
  */
 

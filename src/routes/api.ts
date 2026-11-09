@@ -1996,7 +1996,7 @@ router.delete('/blacklist/:id', (req: Request, res: Response) => {
 });
 
 
-// POST /api/jobs/:id/cv-compare — compare job to a saved CV using OpenAI
+// POST /api/jobs/:id/cv-compare — compare job to a saved CV using the selected AI provider
 router.post('/jobs/:id/cv-compare', async (req: Request, res: Response) => {
   const db = getDb();
   const profileId = req.profile.id;

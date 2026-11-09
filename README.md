@@ -22,7 +22,8 @@ Each pipeline run (scheduled or manual):
 
 Fetching and scoring are both throttled to what your provider accounts actually allow. The app asks
 Apify and OpenAI for their limits and sizes itself from the answer; Gemini uses a conservative
-application default (see [Concurrency](#concurrency)).
+application default (see [Concurrency](#concurrency)). The selected AI provider is used for
+scoring, deduplication, summaries, enrichment, and CV comparison.
 
 ---
 
@@ -64,8 +65,8 @@ npm install
 cp .env.example .env
 ```
 ```env
-# Apify/OpenAI here serve hosted-credits mode only — see the note below.
-# Gemini is configured per profile in Settings → AI Setup and is available for own-key mode.
+# Apify/OpenAI here seed hosted-credits mode only — see the note below.
+# Gemini is configured per profile in Settings → AI Setup for own-key mode.
 APIFY_API_TOKEN=
 OPENAI_API_KEY=
 RESEND_API_KEY=
@@ -73,9 +74,6 @@ EMAIL_FROM=jobs@yourdomain.com
 PORT=3000
 DATABASE_PATH=./data/jobs.db   # created on first boot
 ```
-
-> `.env.example` still lists `DASHBOARD_USER` / `DASHBOARD_PASS`. Basic auth was replaced by
-> email OTP — those two are read by nothing and can be deleted.
 
 Resend is required for login as well as digests, but the two resolve differently: **digests** read
 `settings.resend_api_key` and fall back to `.env`; **login OTP** reads the *admin profile's* saved
@@ -102,6 +100,27 @@ Or `npm start` (same thing) / `npm run dev` for ts-node without a build.
 Open `http://localhost:3000`. The **first** email entered on `/welcome` becomes profile 1 with
 `is_admin = 1` and is signed in immediately — no OTP, no Resend key needed for that one login.
 Every later sign-in, including the admin's own, goes through an emailed code.
+
+### Using Google Gemini instead of OpenAI
+
+Gemini is an own-key option for self-hosted or bring-your-own-key profiles. It is not available
+when a profile uses the hosted-credit balance, which is backed by the operator's OpenAI key.
+
+1. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/apikey).
+2. Open **Settings → AI Setup**, choose **Use your own keys**, and select **Google Gemini** as
+   the AI provider.
+3. Enter and save both the **Apify API token** and **Gemini API key**. The Apify token still
+   supplies job discovery; the Gemini key supplies all profile-level AI work.
+4. Use **Test key** to verify the Gemini key, then choose the soft (easy) and hard-task models
+   in **LLM models**. Model options are filtered to the selected provider.
+5. Start a run or enable a schedule. The profile's saved keys are used; `.env` is not consulted
+   for own-key runs.
+
+The soft model handles initial scoring and the deduplication pre-filter. The hard model handles
+strong-match re-scoring, full deduplication, and CV comparison. Gemini requests use the app's
+conservative default concurrency unless `SCORING_CONCURRENCY` is set; OpenAI-only rate-limit
+telemetry and balance checks do not apply to Gemini. The Gemini client also limits each
+key/model pair to five requests per minute and retries transient provider failures.
 
 **4. Fill the free job pool (otherwise 4 of the 5 default sources return nothing)**
 
@@ -130,22 +149,25 @@ changes, and the vendors' own published tables lag reality.
 |---|---|---|
 | **Apify** | `GET /v2/users/me/limits` → `maxConcurrentActorJobs`, minus one reserved slot so a run you start by hand in the Apify console still fits | at most once a day |
 | **OpenAI** | the `x-ratelimit-limit-requests` / `x-ratelimit-limit-tokens` headers on a 16-token probe call (~$0.0003), read **per model** | at most once a month |
+| **Gemini** | no account-limit probe; uses the app's conservative default, or `SCORING_CONCURRENCY` when set | every run |
 
-Both are measured before a run starts, so the first run after a plan change is already correct.
-Both are hard-capped (3s / 10s), swallow every error, and back off for an hour after a failure — a
-provider outage costs a conservative ceiling for that run and nothing else. An account that has
-never been reached falls back to **4**.
+Apify and OpenAI are measured before a run starts, so the first run after a plan change is already
+correct. Their probes are hard-capped (3s / 10s), swallow every error, and back off for an hour
+after a failure — a provider outage costs a conservative ceiling for that run and nothing else.
+Accounts that have never been reached fall back to **4**. Gemini uses the same conservative
+fallback unless the instance-wide override is set.
 
-The measured figures appear read-only under the API keys on **Settings → AI Setup** (own-keys
-users) and **Admin → General** (the account every hosted profile runs through), in plain terms —
-*"up to 28 job searches at once"* — with the date each was taken.
+OpenAI and Apify measurements appear read-only under the API keys on **Settings → AI Setup**
+(own-key users) and **Admin → General** (the account every hosted profile runs through), in plain
+terms — *"up to 28 job searches at once"* — with the date each was taken. Gemini does not show
+OpenAI tier or limit data.
 
 ### Optional tuning
 
 | Variable | Default | Effect |
 |---|---|---|
 | `APIFY_CONCURRENCY` | _(measured)_ | Override for concurrent Apify actor runs. `0` falls through to the measurement — to loosen the gate, set a large number. |
-| `SCORING_CONCURRENCY` | _(measured)_ | Override for parallel OpenAI scoring calls. `0` falls through to the measurement. |
+| `SCORING_CONCURRENCY` | _(measured/default)_ | Override for parallel OpenAI or Gemini scoring calls. `0` falls through to the provider measurement or Gemini's default. |
 | `MAX_CONCURRENT_RUNS` | `6` | Pipelines in flight at once. |
 | `VALIG_SKIP_JOB_IDS` | on | Set `0` to stop sending already-seen job ids to the valig actor. Does not disable the `titleInclude` filter. |
 
@@ -166,6 +188,9 @@ node scripts/backfill-countries.js
 # Regenerate AI summaries for all Strong Match jobs (e.g. after changing the summary prompt).
 node scripts/backfill-summaries.js
 ```
+
+`backfill-summaries.js` is an OpenAI-only maintenance script. It reads `OPENAI_API_KEY` from
+`.env` and does not use a profile's selected provider or saved Gemini key.
 
 **To keep it running with PM2:**
 ```bash
@@ -197,12 +222,14 @@ pm2 save
 | Service | Purpose | Free tier |
 |---|---|---|
 | [Apify](https://apify.com) | Job discovery (HarvestAPI, Valig, Indeed, StepStone actors) | Pay as you go |
-| [OpenAI](https://platform.openai.com) | AI scoring, dedup & summaries | Pay as you go (~$0.50/day typical) |
+| [OpenAI](https://platform.openai.com) | AI scoring, dedup & summaries for OpenAI profiles and hosted credits | Pay as you go (~$0.50/day typical) |
+| [Google Gemini](https://ai.google.dev/gemini-api/docs) | AI scoring, dedup & summaries for Gemini own-key profiles | See Google AI Studio quotas |
 | [Resend](https://resend.com) | OTP login + email digests | 100 emails/day free |
 
-> **A free OpenAI account is not enough.** Free tiers cap requests per *day* as well as per minute,
-> and a normal run needs more than a day's allowance in one go — scoring will stop part-way and the
-> error will say so. Adding credit to the account lifts both limits.
+> **A free OpenAI account is not enough for a typical run.** Free tiers cap requests per *day* as
+> well as per minute, and a normal run needs more than a day's allowance in one go — scoring will
+> stop part-way and the error will say so. Adding credit to the account lifts both limits. Gemini
+> users are subject to Google's current Gemini API quotas instead.
 
 ---
 
@@ -214,7 +241,7 @@ pm2 save
 - **Profile description** — a top-level background/CV context field injected into every AI scoring call; can be shared across all roles or overridden per role
 - **Languages + current location** — preferred posting languages drive the language disqualifier; your current country gates the visa/relocation rejection rule
 - **Dual AI model configuration** — a fast soft model for batch scoring and a separate hard model for semantic dedup, re-scoring, and CV comparison; both configurable independently
-- **Self-sizing concurrency** — the app reads what your Apify and OpenAI accounts allow and throttles itself to it, per model, with nothing to configure and no way to over-commit an account
+- **Provider-aware concurrency** — the app measures Apify and OpenAI limits where supported and uses a conservative Gemini default, with an optional instance-wide override
 - **Score thresholds** — scores run 0–100; thresholds for Strong (default ≥71), Weak (51–70), and No Match (≤50) are configurable per Role
 - **Work mode & job type filters** — filter by remote/hybrid/onsite and full/part/fixed-term, honored per provider (some sources skip filters they can't support)
 - **Title word filter** — narrow results without changing search keywords; on the valig source it is also sent to the provider, so filtered-out listings are never billed

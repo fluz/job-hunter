@@ -54,12 +54,19 @@ router.get('/', (req: Request, res: Response) => {
     SELECT p.id, p.email, p.is_admin, p.created_at, p.last_active_at, p.active_day_last,
            COALESCE(s.credits_balance, 0) AS credits_balance,
            COALESCE(s.credits_overspent_usd, 0) AS credits_overspent_usd,
-           (TRIM(COALESCE(s.user_openai_api_key, '')) != ''
-            AND TRIM(COALESCE(s.user_apify_api_token, '')) != '') AS has_own_keys
+           COALESCE(s.ai_provider, 'openai') AS ai_provider,
+           CASE COALESCE(s.ai_provider, 'openai')
+             WHEN 'gemini' THEN
+               (TRIM(COALESCE(s.user_gemini_api_key, '')) != ''
+                AND TRIM(COALESCE(s.user_apify_api_token, '')) != '')
+             ELSE
+               (TRIM(COALESCE(s.user_openai_api_key, '')) != ''
+                AND TRIM(COALESCE(s.user_apify_api_token, '')) != '')
+           END AS has_own_keys
     FROM profiles p
     LEFT JOIN settings s ON s.profile_id = p.id
     ORDER BY p.id ASC
-  `).all() as Array<{ id: number; email: string; is_admin: number; created_at: string; last_active_at: string | null; active_day_last: string | null; credits_balance: number; credits_overspent_usd: number; has_own_keys: number }>;
+  `).all() as Array<{ id: number; email: string; is_admin: number; created_at: string; last_active_at: string | null; active_day_last: string | null; credits_balance: number; credits_overspent_usd: number; ai_provider: string; has_own_keys: number }>;
 
   // Tombstones of deleted accounts (`/api/profiles/:id/delete`). They carry no email, so they cannot
   // render as rows in the list above — they exist so the total-ever count stays answerable and so the

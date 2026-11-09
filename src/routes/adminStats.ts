@@ -183,7 +183,14 @@ export function getAdminTotals(): AdminTotals {
     adminUsers: one(`SELECT COUNT(*) AS c FROM profiles WHERE is_admin = 1`),
     ownKeys: one(`
       SELECT COUNT(*) AS c FROM settings s JOIN profiles p ON p.id = s.profile_id
-      WHERE TRIM(COALESCE(s.user_openai_api_key, '')) != ''
+      WHERE p.is_admin = 0
+        AND (
+          (COALESCE(s.ai_provider, 'openai') = 'gemini'
+           AND TRIM(COALESCE(s.user_gemini_api_key, '')) != '')
+          OR
+          (COALESCE(s.ai_provider, 'openai') != 'gemini'
+           AND TRIM(COALESCE(s.user_openai_api_key, '')) != '')
+        )
         AND TRIM(COALESCE(s.user_apify_api_token, '')) != ''`),
     activated: one(`
       SELECT COUNT(DISTINCT r.profile_id) AS c FROM search_runs r
